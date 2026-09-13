@@ -1,4 +1,4 @@
-"""Pure DSP/rendering helpers for the waterfall display.
+"""Pure DSP/rendering helpers for the waterfall display and station seeking.
 
 Kept separate from fm_gui.py so the actual math (spectrum estimation, the
 scrolling image buffer, color mapping) can be unit tested without touching
@@ -30,6 +30,32 @@ def compute_spectrum_db(samples, nfft=2048, window=None):
     power_acc /= n_segments
 
     return (10 * np.log10(power_acc + 1e-12)).astype(np.float32)
+
+
+def estimate_channel_prominence_db(spectrum_db, sample_rate,
+                                    channel_half_bw_hz=100_000,
+                                    floor_lo_hz=300_000, floor_hi_hz=450_000):
+    """How many dB the power right at the tuned center rises above the
+    noise floor out near the edges of the captured span -- a real FM
+    station shows up as a broad hump around its own carrier, while empty
+    spectrum looks flat from center to edge. This is a same-capture
+    relative comparison, so it stays meaningful regardless of the RTL-SDR's
+    AGC gain at the moment (which would corrupt any threshold on absolute
+    power). Used by fm_gui.py's seek feature to decide "there's a station
+    here" without needing to demodulate anything."""
+    nfft = len(spectrum_db)
+    bin_hz = sample_rate / nfft
+    center = nfft // 2
+
+    def bin_index(hz):
+        return int(np.clip(center + hz / bin_hz, 0, nfft))
+
+    channel_db = spectrum_db[bin_index(-channel_half_bw_hz):bin_index(channel_half_bw_hz)]
+    floor_db = np.concatenate([
+        spectrum_db[bin_index(-floor_hi_hz):bin_index(-floor_lo_hz)],
+        spectrum_db[bin_index(floor_lo_hz):bin_index(floor_hi_hz)],
+    ])
+    return float(np.mean(channel_db) - np.mean(floor_db))
 
 
 def make_colormap_lut(name='viridis', n=256):

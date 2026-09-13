@@ -12,11 +12,11 @@ from scipy.signal import decimate
 import sounddevice as sd
 from rtlsdr import RtlSdr
 
-DEFAULT_FREQ_MHZ = 100.7
+DEFAULT_FREQ_MHZ = 95.7
 SDR_SAMPLE_RATE = 1_024_000   # Hz, wide enough for a 200 kHz FM channel
 AUDIO_SAMPLE_RATE = 48_000    # Hz, standard audio playback rate
 DECIM = SDR_SAMPLE_RATE // AUDIO_SAMPLE_RATE  # ~21
-SECONDS_PER_BLOCK = 0.5
+SECONDS_PER_BLOCK = 0.1
 SAMPLES_PER_BLOCK = int(SDR_SAMPLE_RATE * SECONDS_PER_BLOCK)
 QUEUE_MAXSIZE = 6  # ~3 seconds of buffered audio blocks
 OUTPUT_LATENCY_S = 0.3  # PortAudio output buffer target; see main() for why

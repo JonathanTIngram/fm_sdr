@@ -9,7 +9,9 @@ import threading
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtWidgets import QApplication, QDial, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QApplication, QDial, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+)
 import sounddevice as sd
 from rtlsdr import RtlSdr
 
@@ -24,6 +26,7 @@ from fm_listen import (
     QUEUE_MAXSIZE,
     OUTPUT_LATENCY_S,
 )
+from fm_visuals import compute_spectrum_db, estimate_channel_prominence_db
 from fm_waterfall import WaterfallWindow
 from fm_spectrum import SpectrumAnalyzerWindow
 from fm_rds import RdsWindow
@@ -32,6 +35,15 @@ FREQ_MIN_MHZ = 88.0
 FREQ_MAX_MHZ = 108.0
 FREQ_STEP_MHZ = 0.1
 DEFAULT_VOLUME_PCT = 80
+
+# Seek scans one FREQ_STEP_MHZ at a time, reading a short burst at each
+# candidate frequency and checking for a broad power hump at the tuned
+# center (see fm_visuals.estimate_channel_prominence_db) rather than
+# demodulating -- much cheaper per step, and works regardless of AGC gain.
+SEEK_NFFT = 1024
+SEEK_SETTLE_SAMPLES = 4096   # discarded: lets the tuner's PLL settle after retuning
+SEEK_MEASURE_SAMPLES = SEEK_NFFT * 16
+SEEK_PROMINENCE_DB = 10.0    # empirical: real broadcast signals sit well above this
 
 # on_samples (waterfall/spectrum feed) only gets called once per full block
 # read -- once every SECONDS_PER_BLOCK (0.5s) -- which visibly bottlenecks
@@ -66,6 +78,8 @@ class SdrWorker(QThread):
     without changing the block fm_demodulate() ever sees."""
 
     error = pyqtSignal(str)
+    seek_progress = pyqtSignal(float)  # MHz, emitted as each candidate frequency is checked
+    seek_finished = pyqtSignal(float)  # MHz, the frequency seeking landed on
 
     def __init__(self, initial_freq_hz, initial_volume, on_samples=None):
         super().__init__()
@@ -77,6 +91,12 @@ class SdrWorker(QThread):
         self.sdr = None
         self.player = None
 
+        self._seeking = False
+        self._seek_direction = 0
+        self._seek_start_freq_hz = None
+        self._seek_steps_taken = 0
+        self._seek_total_steps = 0
+
     def set_freq(self, freq_hz):
         with self._lock:
             self._freq_hz = freq_hz
@@ -87,6 +107,20 @@ class SdrWorker(QThread):
         self._volume = volume
         if self.player is not None:
             self.player.volume = volume
+
+    def seek(self, direction):
+        """Start scanning up (+1) or down (-1) from the current frequency
+        for the next frequency with a real signal on it. Muted (nothing
+        gets enqueued to play) until it lands, since scanning necessarily
+        passes over a lot of static. No-op if already seeking."""
+        with self._lock:
+            if self._seeking:
+                return
+            self._seeking = True
+            self._seek_direction = direction
+            self._seek_start_freq_hz = self._freq_hz
+            self._seek_steps_taken = 0
+            self._seek_total_steps = round((FREQ_MAX_MHZ - FREQ_MIN_MHZ) / FREQ_STEP_MHZ) + 1
 
     def stop(self):
         self._running = False
@@ -109,6 +143,10 @@ class SdrWorker(QThread):
             stream.start()
 
             while self._running:
+                if self._seeking:
+                    self._seek_step()
+                    continue
+
                 chunks = []
                 for _ in range(VISUAL_CHUNKS_PER_BLOCK):
                     with self._lock:
@@ -131,6 +169,44 @@ class SdrWorker(QThread):
                 stream.close()
             if self.sdr is not None:
                 self.sdr.close()
+
+    def _seek_step(self):
+        """Check one candidate frequency, then either stop (found a signal,
+        or scanned the whole band and gave up -- back to where it started)
+        or leave self._seeking set so the next run() iteration checks the
+        next one. Runs entirely on this thread; no audio gets enqueued
+        while seeking, so playback drains to silence on its own."""
+        step_hz = FREQ_STEP_MHZ * 1e6
+        min_hz, max_hz = FREQ_MIN_MHZ * 1e6, FREQ_MAX_MHZ * 1e6
+
+        with self._lock:
+            next_freq = self._freq_hz + self._seek_direction * step_hz
+            if next_freq > max_hz + 1:
+                next_freq = min_hz
+            elif next_freq < min_hz - 1:
+                next_freq = max_hz
+            self._freq_hz = next_freq
+            self.sdr.center_freq = next_freq
+            self.sdr.read_samples(SEEK_SETTLE_SAMPLES)
+            measured = self.sdr.read_samples(SEEK_MEASURE_SAMPLES)
+
+        self.seek_progress.emit(next_freq / 1e6)
+        if self._on_samples is not None:
+            self._on_samples(measured)  # keep spectrum/waterfall/RDS windows live during the scan
+
+        self._seek_steps_taken += 1
+        spectrum_db = compute_spectrum_db(measured, SEEK_NFFT)
+        prominence = estimate_channel_prominence_db(spectrum_db, SDR_SAMPLE_RATE)
+        found = prominence > SEEK_PROMINENCE_DB
+        exhausted = self._seek_steps_taken >= self._seek_total_steps
+
+        if found or exhausted:
+            if not found:
+                with self._lock:
+                    self._freq_hz = self._seek_start_freq_hz
+                    self.sdr.center_freq = self._freq_hz
+            self._seeking = False
+            self.seek_finished.emit(self._freq_hz / 1e6)
 
 
 def _make_knob_panel(title, dial, value_label):
@@ -169,6 +245,17 @@ class TunerWindow(QWidget):
         self.freq_dial.valueChanged.connect(self._on_freq_changed)
         freq_panel = _make_knob_panel("Frequency", self.freq_dial, self.freq_label)
 
+        self.seek_down_btn = QPushButton("◀ Seek")
+        self.seek_up_btn = QPushButton("Seek ▶")
+        self.seek_down_btn.clicked.connect(lambda: self._start_seek(-1))
+        self.seek_up_btn.clicked.connect(lambda: self._start_seek(1))
+        seek_row = QHBoxLayout()
+        seek_row.addWidget(self.seek_down_btn)
+        seek_row.addWidget(self.seek_up_btn)
+        freq_column = QVBoxLayout()
+        freq_column.addLayout(freq_panel)
+        freq_column.addLayout(seek_row)
+
         # Volume knob
         self.volume_label = QLabel(f"{DEFAULT_VOLUME_PCT}%")
         self.volume_dial = QDial()
@@ -179,7 +266,7 @@ class TunerWindow(QWidget):
         volume_panel = _make_knob_panel("Volume", self.volume_dial, self.volume_label)
 
         knobs_row = QHBoxLayout()
-        knobs_row.addLayout(freq_panel)
+        knobs_row.addLayout(freq_column)
         knobs_row.addLayout(volume_panel)
 
         self.setLayout(knobs_row)
@@ -208,7 +295,28 @@ class TunerWindow(QWidget):
             on_samples=on_samples,
         )
         self.worker.error.connect(self._on_error)
+        self.worker.seek_progress.connect(self._on_seek_progress)
+        self.worker.seek_finished.connect(self._on_seek_finished)
         self.worker.start()
+
+    def _start_seek(self, direction):
+        self.seek_down_btn.setEnabled(False)
+        self.seek_up_btn.setEnabled(False)
+        self.freq_dial.setEnabled(False)
+        self.worker.seek(direction)
+
+    def _on_seek_progress(self, freq_mhz):
+        self.freq_label.setText(f"{freq_mhz:.1f} MHz")
+
+    def _on_seek_finished(self, freq_mhz):
+        self.seek_down_btn.setEnabled(True)
+        self.seek_up_btn.setEnabled(True)
+        self.freq_dial.setEnabled(True)
+        self.freq_label.setText(f"{freq_mhz:.1f} MHz")
+        self.freq_dial.blockSignals(True)
+        self.freq_dial.setValue(round(freq_mhz / FREQ_STEP_MHZ))
+        self.freq_dial.blockSignals(False)
+        self.rds_window.reset()  # scanning fed the RDS decoder noise from every skipped frequency
 
     def _on_freq_changed(self, steps):
         freq_mhz = steps * FREQ_STEP_MHZ

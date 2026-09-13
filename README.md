@@ -9,6 +9,7 @@
 ![alt spectrum](./mdImages/spectrumAnalyzer.png)
 ## RDS Packet Info
 ![alt rds](./mdImages/rdsPacketInfo.png)
+For further reference on RDS packets refer to: https://en.wikipedia.org/wiki/Radio_Data_System
 
 
 ## Standard FM broadcast max frequency devication

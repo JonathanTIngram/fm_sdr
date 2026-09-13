@@ -5,7 +5,9 @@ Pure numpy -- no Qt, SDR, or audio device involved.
 import numpy as np
 import pytest
 
-from fm_visuals import compute_spectrum_db, make_colormap_lut, Waterfall
+from fm_visuals import (
+    compute_spectrum_db, estimate_channel_prominence_db, make_colormap_lut, Waterfall,
+)
 
 
 def test_spectrum_output_length_is_nfft():
@@ -33,6 +35,45 @@ def test_spectrum_peak_locates_tone_frequency():
     peak_freq = freq_bins[np.argmax(spectrum)]
 
     assert peak_freq == pytest.approx(tone_freq, abs=fs / nfft * 2)
+
+
+def test_channel_prominence_detects_elevated_center():
+    fs = 1_024_000
+    nfft = 1024
+    bin_hz = fs / nfft
+    center = nfft // 2
+    half_bw_bins = int(100_000 / bin_hz)
+
+    spectrum = np.full(nfft, -50.0, dtype=np.float32)  # flat noise floor
+    spectrum[center - half_bw_bins:center + half_bw_bins] = -10.0  # broad hump at the tuned center
+
+    prominence = estimate_channel_prominence_db(spectrum, fs)
+    assert prominence == pytest.approx(40, abs=1)
+
+
+def test_channel_prominence_near_zero_for_flat_spectrum():
+    fs = 1_024_000
+    spectrum = np.full(1024, -30.0, dtype=np.float32)
+
+    prominence = estimate_channel_prominence_db(spectrum, fs)
+    assert prominence == pytest.approx(0, abs=0.5)
+
+
+def test_channel_prominence_ignores_hump_outside_channel_and_floor_bands():
+    fs = 1_024_000
+    nfft = 1024
+    bin_hz = fs / nfft
+    center = nfft // 2
+
+    spectrum = np.full(nfft, -50.0, dtype=np.float32)
+    # a strong hump between the channel window and the floor bands -- not
+    # the tuned frequency, so it shouldn't move the prominence estimate
+    lo = center + int(150_000 / bin_hz)
+    hi = center + int(250_000 / bin_hz)
+    spectrum[lo:hi] = 0.0
+
+    prominence = estimate_channel_prominence_db(spectrum, fs)
+    assert abs(prominence) < 1
 
 
 def test_colormap_lut_shape_and_range():

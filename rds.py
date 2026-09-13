@@ -238,6 +238,7 @@ class GroupParser:
         self.pty = None
         self.ps_chars = [' '] * 8
         self.rt_chars = [' '] * 64
+        self.rt_ab_flag = None
         self.log = deque(maxlen=log_maxlen)
         self.group_count = 0  # monotonic; log itself evicts old entries
         self._pending = {}
@@ -264,20 +265,37 @@ class GroupParser:
         self.pi_code = a
         group_type = (b >> 12) & 0xF
         version_b = (b >> 11) & 0x1
+        tp = (b >> 10) & 0x1
         self.pty = (b >> 5) & 0x1F
 
         entry = {
             'pi': a, 'group_type': group_type,
-            'version': 'B' if version_b else 'A', 'pty': self.pty,
+            'version': 'B' if version_b else 'A', 'tp': tp, 'pty': self.pty,
             'fields': {},
         }
 
         if group_type == 0:
+            ta = (b >> 4) & 0x1
+            ms = (b >> 3) & 0x1
+            di = (b >> 2) & 0x1
             segment = b & 0x3
             chars = chr((d >> 8) & 0xFF) + chr(d & 0xFF)
             self.ps_chars[segment * 2:segment * 2 + 2] = list(chars)
-            entry['fields'] = {'name': 'PS', 'segment': segment, 'chars': chars}
+            entry['fields'] = {
+                'name': 'PS', 'segment': segment, 'chars': chars,
+                'ta': ta, 'ms': ms, 'di': di,
+            }
         elif group_type == 2:
+            # Bit 4 is the text A/B flag: stations toggle it whenever a
+            # brand-new RadioText message starts, so receivers know to wipe
+            # any leftover characters from the previous message instead of
+            # splicing the new one into the old buffer -- without this, a
+            # shorter new message leaves stale tail characters behind.
+            text_ab = (b >> 4) & 0x1
+            if self.rt_ab_flag is not None and text_ab != self.rt_ab_flag:
+                self.rt_chars = [' '] * 64
+            self.rt_ab_flag = text_ab
+
             segment = b & 0xF
             if version_b == 0:
                 chars = chr((c >> 8) & 0xFF) + chr(c & 0xFF) + chr((d >> 8) & 0xFF) + chr(d & 0xFF)
@@ -287,7 +305,9 @@ class GroupParser:
                 base = segment * 2
             end = min(base + len(chars), 64)
             self.rt_chars[base:end] = list(chars[:end - base])
-            entry['fields'] = {'name': 'RT', 'segment': segment, 'chars': chars}
+            entry['fields'] = {
+                'name': 'RT', 'segment': segment, 'chars': chars, 'text_ab': text_ab,
+            }
 
         return entry
 

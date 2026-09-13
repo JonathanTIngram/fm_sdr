@@ -123,6 +123,37 @@ def test_group_parser_decodes_radiotext_version_b():
     assert parser.radiotext == message.rstrip()
 
 
+def test_group_parser_clears_radiotext_on_text_ab_toggle():
+    pi = 0xABCD
+    old_message = "OLD ARTIST - LONG SONG TITLE HERE".ljust(64)[:64]
+    bits = []
+    for segment in range(16):
+        chunk = old_message[segment * 4:segment * 4 + 4]
+        b_value = (2 << 12) | (0 << 11) | (0 << 4) | segment  # text A/B flag = 0
+        c_value = (ord(chunk[0]) << 8) | ord(chunk[1])
+        d_value = (ord(chunk[2]) << 8) | ord(chunk[3])
+        bits += bits_for_group(pi, b_value, c_value, d_value)
+
+    sync = BlockSynchronizer()
+    parser = GroupParser()
+    for block_type, data in sync.feed(bits):
+        parser.feed_block(block_type, data)
+    assert parser.radiotext == old_message.rstrip()
+
+    # New, shorter message with the text A/B flag toggled -- only the first
+    # segment arrives so far, but the flag flip must wipe the rest of the
+    # old message's leftover tail rather than splicing onto it.
+    new_first_chunk = "NEW "
+    b_value = (2 << 12) | (0 << 11) | (1 << 4) | 0  # text A/B flag flipped to 1
+    c_value = (ord(new_first_chunk[0]) << 8) | ord(new_first_chunk[1])
+    d_value = (ord(new_first_chunk[2]) << 8) | ord(new_first_chunk[3])
+    bits = bits_for_group(pi, b_value, c_value, d_value)
+    for block_type, data in sync.feed(bits):
+        parser.feed_block(block_type, data)
+
+    assert parser.radiotext == "NEW"
+
+
 def test_differential_bits_recovers_known_pattern():
     target_bits = [1, 0, 1, 1, 0, 0, 1]
     samples_per_bit = SAMPLES_PER_BIT
