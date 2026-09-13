@@ -1,5 +1,4 @@
-# Python FM SDR
-
+# FM radio parser using an RTL-SDR V4 with a QT GUI
 
 ## FM TUNER
 ![alt text](./mdImages/fmTuner.png)
